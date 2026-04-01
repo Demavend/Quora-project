@@ -3,43 +3,77 @@ text_preprocessing.py
 
 Reusable text preprocessing utilities for the Quora Question Pairs project.
 
-Design goals:
-- Keep functions small and composable (EDA / feature engineering can mix-and-match).
-- Be explicit with flags (classic ML vs transformer-style minimal cleaning).
-- Safe defaults for missing values.
+This module is intentionally limited to text cleanup and normalization.
+It should not contain pairwise similarity features or other feature engineering logic.
+
+Main use cases:
+- minimal normalization for general text cleanup;
+- classic-ML preprocessing for sparse vectorizers such as BoW / TF-IDF;
+- optional comparison of stopword removal, lemmatization, and stemming.
 
 Notes:
-- For TF-IDF / BoW, you may enable stopword removal and (optionally) stemming/lemmatization.
-- For BERT / transformer embeddings, usually use only normalize_text(minimal) and skip stopwords/stemming.
-
-Dependencies:
-- bs4 (BeautifulSoup) is optional; if not available, HTML stripping falls back to regex.
-- nltk is used for stopwords, stemming, and lemmatization.
+- BeautifulSoup is optional; HTML stripping falls back to a regex when unavailable.
+- NLTK resources can be prepared with ensure_nltk_resources().
 """
 
 from __future__ import annotations
 
+import html
 import re
-from typing import Iterable, List, Optional
+from functools import lru_cache
+from typing import Iterable, List, Optional, Sequence
 
 try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
 
+import contractions
+import nltk
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 
 
-import contractions
+DEFAULT_NLTK_RESOURCES: Sequence[str] = (
+    "stopwords",
+    "wordnet",
+    "omw-1.4",
+)
+
+
+def ensure_nltk_resources(resources: Sequence[str] = DEFAULT_NLTK_RESOURCES, *, quiet: bool = True) -> None:
+    """
+    Download required NLTK resources if they are missing.
+
+    This helper is convenient for notebooks where the environment may be fresh.
+    """
+    lookup_map = {
+        "stopwords": "corpora/stopwords",
+        "wordnet": "corpora/wordnet",
+        "omw-1.4": "corpora/omw-1.4",
+    }
+
+    for resource in resources:
+        lookup_name = lookup_map.get(resource, resource)
+        try:
+            nltk.data.find(lookup_name)
+        except LookupError:
+            nltk.download(resource, quiet=quiet)
 
 
 def strip_html(text: str) -> str:
     """Remove HTML markup while keeping visible text."""
     if not text:
         return ""
+
+    # Avoid passing plain filenames or ordinary text into BeautifulSoup.
+    # If the string does not look like HTML/XML markup, return it as is.
+    if "<" not in text and ">" not in text:
+        return text
+
     if BeautifulSoup is not None:
         return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+
     return re.sub(r"<[^>]+>", " ", text)
 
 
@@ -57,9 +91,14 @@ def normalize_text(
     """
     Normalize raw text into a cleaned string.
 
-    This function does NOT remove stopwords and does NOT stem/lemmatize by default.
+    This function keeps word forms intact and does not remove stopwords.
+    It is a good default for a lightweight, non-aggressive text version.
     """
     x = "" if text is None else str(text)
+    x = html.unescape(x)
+
+    if strip_html_markup:
+        x = strip_html(x)
 
     if lowercase:
         x = x.lower()
@@ -79,15 +118,11 @@ def normalize_text(
 
     if normalize_numbers:
         x = x.replace(",000,000", "m").replace(",000", "k")
-        x = re.sub(r"([0-9]+)000000", r"\1m", x)
-        x = re.sub(r"([0-9]+)000", r"\1k", x)
+        x = re.sub(r"([0-9]+)000000\b", r"\1m", x)
+        x = re.sub(r"([0-9]+)000\b", r"\1k", x)
 
     if remove_non_alnum:
-        # Keep letters, digits, and whitespace
         x = re.sub(r"[^a-z0-9\s]", " ", x)
-
-    if strip_html_markup:
-        x = strip_html(x)
 
     if normalize_whitespace:
         x = re.sub(r"\s+", " ", x).strip()
@@ -96,33 +131,36 @@ def normalize_text(
 
 
 def simple_tokenize(text: str) -> List[str]:
-    """Whitespace tokenization. Assumes text already normalized."""
+    """Whitespace tokenization. Assumes text is already normalized."""
     if not text:
         return []
     return text.split()
 
 
-def get_stopwords(language: str = "english") -> set:
-    """Load stopword set for a language (requires nltk stopwords corpus)."""
+@lru_cache(maxsize=None)
+def get_stopwords(language: str = "english") -> set[str]:
+    """Load stopword set for a language and cache the result."""
+    ensure_nltk_resources(("stopwords",))
     return set(stopwords.words(language))
 
 
 def remove_stopwords(tokens: Iterable[str], *, language: str = "english") -> List[str]:
-    """Remove stopwords from token sequence."""
+    """Remove stopwords from a token sequence."""
     sw = get_stopwords(language)
-    return [t for t in tokens if t and t not in sw]
+    return [token for token in tokens if token and token not in sw]
 
 
 def stem_tokens(tokens: Iterable[str]) -> List[str]:
-    """Stem tokens using Porter stemmer."""
+    """Stem tokens using the Porter stemmer."""
     stemmer = PorterStemmer()
-    return [stemmer.stem(t) for t in tokens if t]
+    return [stemmer.stem(token) for token in tokens if token]
 
 
 def lemmatize_tokens(tokens: Iterable[str]) -> List[str]:
-    """Lemmatize tokens using WordNet lemmatizer."""
+    """Lemmatize tokens using the WordNet lemmatizer."""
+    ensure_nltk_resources(("wordnet", "omw-1.4"))
     lemmatizer = WordNetLemmatizer()
-    return [lemmatizer.lemmatize(t) for t in tokens if t]
+    return [lemmatizer.lemmatize(token) for token in tokens if token]
 
 
 def preprocess_classic_ml(
@@ -135,10 +173,18 @@ def preprocess_classic_ml(
     language: str = "english",
 ) -> str:
     """
-    A convenient preprocessing pipeline for classic ML vectorizers (BoW/TF-IDF).
+    Preprocess text for classic ML vectorizers such as BoW or TF-IDF.
 
-    Returns a single string (tokens joined with spaces).
+    The function returns a single string with tokens joined by spaces.
+
+    Rules:
+    - stopword removal is optional;
+    - lemmatization and stemming are optional;
+    - stemming and lemmatization cannot be enabled at the same time.
     """
+    if use_stemming and use_lemmatization:
+        raise ValueError("Choose either stemming or lemmatization, not both.")
+
     x = normalize_text(
         text,
         lowercase=lowercase,
