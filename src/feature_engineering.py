@@ -10,12 +10,14 @@ Its job is to convert cleaned question pairs into numeric pair features.
 Main feature groups:
 - basic lexical and length features;
 - fuzzy string-matching features;
-- sparse-vector similarity features based on BoW / TF-IDF.
+- sparse-vector similarity features based on BoW / TF-IDF;
+- transformer-based semantic similarity features from BERT embeddings.
 
 Notes:
 - the preferred input is the saved dataset from 02_preprocessing.ipynb;
 - q1_norm / q2_norm are used for lexical and fuzzy features;
-- q1_classic / q2_classic are used for sparse vectorizers.
+- q1_classic / q2_classic are used for sparse vectorizers;
+- raw question1 / question2 text is preferred for transformer embeddings.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from tqdm.auto import tqdm
 
 import numpy as np
 import pandas as pd
@@ -303,6 +306,152 @@ def l1_distance_dense(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.abs(a - b).sum(axis=1)
 
 
+
+
+def _mean_pool_last_hidden_state(last_hidden_state, attention_mask):
+    mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+    summed = (last_hidden_state * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1e-9)
+    return summed / counts
+
+
+def _load_transformer_encoder(model_name: str):
+    try:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "transformers and torch are required for BERT-based features. "
+            "Install them before running this step."
+        ) from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    return torch, tokenizer, model
+
+
+def _resolve_device(torch, device: Optional[str] = None) -> str:
+    if device is not None:
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _encode_text_batch(
+    texts: Sequence[str],
+    *,
+    torch,
+    tokenizer,
+    model,
+    device: str,
+    max_length: int = 64,
+    pooling: str = "mean",
+) -> np.ndarray:
+    encoded = tokenizer(
+        list(texts),
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    with torch.no_grad():
+        outputs = model(**encoded)
+
+    if pooling == "cls":
+        pooled = outputs.last_hidden_state[:, 0, :]
+    elif pooling == "mean":
+        pooled = _mean_pool_last_hidden_state(
+            outputs.last_hidden_state,
+            encoded["attention_mask"],
+        )
+    else:
+        raise ValueError("pooling must be either 'mean' or 'cls'.")
+
+    return pooled.detach().cpu().numpy()
+
+
+def build_transformer_similarity_features(
+    df: pd.DataFrame,
+    *,
+    q1_col: str = "question1",
+    q2_col: str = "question2",
+    model_name: str = "bert-base-uncased",
+    prefix: str = "bert",
+    batch_size: int = 64,
+    max_length: int = 64,
+    pooling: str = "mean",
+    device: Optional[str] = None,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """
+    Build compact pairwise semantic-similarity features from BERT embeddings.
+    """
+    q1 = df[q1_col].fillna("").astype(str).tolist()
+    q2 = df[q2_col].fillna("").astype(str).tolist()
+
+    torch, tokenizer, model = _load_transformer_encoder(model_name)
+    resolved_device = _resolve_device(torch, device)
+    model = model.to(resolved_device)
+    model.eval()
+
+    total_batches = (len(df) + batch_size - 1) // batch_size
+    iterator = range(0, len(df), batch_size)
+
+    if show_progress:
+        iterator = tqdm(
+            iterator,
+            total=total_batches,
+            desc=f"{prefix.upper()} similarity features",
+            unit="batch",
+        )
+
+    frames = []
+    for start in iterator:
+        end = min(start + batch_size, len(df))
+
+        emb_q1 = _encode_text_batch(
+            q1[start:end],
+            torch=torch,
+            tokenizer=tokenizer,
+            model=model,
+            device=resolved_device,
+            max_length=max_length,
+            pooling=pooling,
+        )
+        emb_q2 = _encode_text_batch(
+            q2[start:end],
+            torch=torch,
+            tokenizer=tokenizer,
+            model=model,
+            device=resolved_device,
+            max_length=max_length,
+            pooling=pooling,
+        )
+
+        abs_diff = np.abs(emb_q1 - emb_q2)
+
+        frames.append(
+            pd.DataFrame(
+                {
+                    f"{prefix}_cosine": cosine_sim_dense(emb_q1, emb_q2),
+                    f"{prefix}_euclidean": l2_distance_dense(emb_q1, emb_q2),
+                    f"{prefix}_manhattan": l1_distance_dense(emb_q1, emb_q2),
+                    f"{prefix}_dot": (emb_q1 * emb_q2).sum(axis=1),
+                    f"{prefix}_absdiff_mean": abs_diff.mean(axis=1),
+                    f"{prefix}_absdiff_max": abs_diff.max(axis=1),
+                }
+            )
+        )
+
+        if show_progress and hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(
+                rows_processed=end,
+                device=resolved_device,
+            )
+
+    return pd.concat(frames, axis=0, ignore_index=True)
+
 def build_similarity_frame(
     *,
     cosine: np.ndarray,
@@ -476,6 +625,14 @@ def get_feature_groups() -> dict[str, list[str]]:
             "tfidf_cosine",
             "tfidf_euclidean",
             "tfidf_manhattan",
+        ],
+        "bert": [
+            "bert_cosine",
+            "bert_euclidean",
+            "bert_manhattan",
+            "bert_dot",
+            "bert_absdiff_mean",
+            "bert_absdiff_max",
         ],
     }
 
