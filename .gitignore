@@ -1,0 +1,43 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data
+data/raw/*
+!data/raw/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+
+# Reports
+reports/*.png
+reports/*.jpg
+reports/*.jpeg
+reports/*.svg
+
+# ML artifacts
+models/
+checkpoints/
+outputs/
+mlruns/
+wandb/
+
+# Local config
+.env
+.env.*

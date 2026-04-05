@@ -1,0 +1,4 @@
+model,log_loss,roc_auc
+xgboost_engineered_features,0.3850574941585477,0.894665498949051
+logreg_tfidf_concat,0.47144869390446004,0.831999211066139
+baseline_prior,0.6585248871634891,0.5
